@@ -13,6 +13,7 @@ import (
 	"time"
 	"html/template"
 	"net/url"
+	"strconv"
 
 	"github.com/joho/godotenv"
 )
@@ -167,6 +168,16 @@ func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply local cooldown to avoid hitting LoginRadius email rate limits
+	allowed, nextAllowed := canRequestPasswordReset(email)
+	if !allowed {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("If an account exists for that email, a password reset link has been sent. Please try again later."))
+		log.Printf("Password reset throttled for %s until %s\n", email, nextAllowed.Format(time.RFC3339))
+		return
+	}
+
 	payload := map[string]string{
 		"email": email,
 	}
@@ -185,11 +196,25 @@ func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
+	cooldownSeconds := 300
+	if v := os.Getenv("RESET_COOLDOWN_SECONDS"); v != "" {
+		if parsed, perr := strconv.Atoi(v); perr == nil && parsed > 0 {
+			cooldownSeconds = parsed
+		}
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		// If LoginRadius says email rate limit exceeded, still set a local cooldown
+		if strings.Contains(string(body), "limit for sending emails") || strings.Contains(string(body), "rate") {
+			markPasswordResetRequested(email, time.Duration(cooldownSeconds)*time.Second)
+		}
 		http.Error(w, "Error: "+string(body), http.StatusBadRequest)
 		return
 	}
+
+	// Success: set local cooldown
+	markPasswordResetRequested(email, time.Duration(cooldownSeconds)*time.Second)
 
 	// Let the user know to check their email for the reset link
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")

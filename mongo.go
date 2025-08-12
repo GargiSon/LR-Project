@@ -12,6 +12,7 @@ import (
 
 var client *mongo.Client
 var sessionCollection *mongo.Collection
+var resetCooldownCollection *mongo.Collection
 
 func connectMongo() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -28,7 +29,8 @@ func connectMongo() {
 		log.Fatal(err)
 	}
 	sessionCollection = client.Database("LRProject3").Collection("sessions")
-	log.Println("Connected to MongoDB and session collection initialized")
+	resetCooldownCollection = client.Database("LRProject3").Collection("reset_cooldowns")
+	log.Println("Connected to MongoDB and collections initialized")
 }
 
 func saveSession(sessionID, token string) {
@@ -62,5 +64,37 @@ func deleteSession(sessionID string) {
 	_, err := sessionCollection.DeleteOne(ctx, map[string]interface{}{"session_id": sessionID})
 	if err != nil {
 		log.Println("Error deleting session:", err)
+	}
+}
+
+// Records and checks cooldown for forgot password per email.
+func canRequestPasswordReset(email string) (bool, time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var doc map[string]any
+	err := resetCooldownCollection.FindOne(ctx, map[string]any{"email": email}).Decode(&doc)
+	if err != nil {
+		// Not found or other error: allow request
+		return true, time.Time{}
+	}
+	nextAllowedAt, _ := doc["next_allowed_at"].(time.Time)
+	if time.Now().Before(nextAllowedAt) {
+		return false, nextAllowedAt
+	}
+	return true, time.Time{}
+}
+
+func markPasswordResetRequested(email string, cooldown time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	next := time.Now().Add(cooldown)
+	_, err := resetCooldownCollection.UpdateOne(
+		ctx,
+		map[string]any{"email": email},
+		map[string]any{"$set": map[string]any{"email": email, "next_allowed_at": next}},
+		options.Update().SetUpsert(true),
+	)
+	if err != nil {
+		log.Println("Error marking password reset cooldown:", err)
 	}
 }
