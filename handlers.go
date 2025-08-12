@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+	"html/template"
+	"net/url"
 
 	"github.com/joho/godotenv"
 )
@@ -129,7 +131,11 @@ func validateToken(token string) bool {
 	url := "https://api.loginradius.com/identity/v2/auth/access_token/validate?apikey=" + apiKey + "&access_token=" + token
 
 	resp, err := http.Get(url)
-	if err != nil || resp.StatusCode != http.StatusOK {
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
 		return false
 	}
 	return true
@@ -162,8 +168,7 @@ func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	payload := map[string]string{
-		"email":            email,
-		"resetPasswordUrl": resetURL,
+		"email": email,
 	}
 	jsonData, err := json.Marshal(payload)
 	if err != nil {
@@ -171,8 +176,9 @@ func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	url := "https://api.loginradius.com/identity/v2/auth/password?apikey=" + apiKey
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	apiEndpoint := "https://api.loginradius.com/identity/v2/auth/password"
+	apiReqURL := fmt.Sprintf("%s?apikey=%s&resetPasswordUrl=%s", apiEndpoint, apiKey, url.QueryEscape(resetURL))
+	resp, err := http.Post(apiReqURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
 		http.Error(w, "Failed to send reset request", http.StatusInternalServerError)
 		return
@@ -185,22 +191,47 @@ func forgotPasswordHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.ServeFile(w, r, "static/reset.html")
+	// Let the user know to check their email for the reset link
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("If an account exists for that email, a password reset link has been sent."))
 }
 
 func resetPasswordHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
-		http.ServeFile(w, r, "static/reset.html")
+		// Extract token from common query parameter names
+		token := r.URL.Query().Get("vtoken")
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
+		// Render template injecting token so the hidden field is populated
+		tmpl, err := template.ParseFiles("static/reset.html")
+		if err != nil {
+			http.Error(w, "Failed to load reset page", http.StatusInternalServerError)
+			return
+		}
+		_ = tmpl.Execute(w, map[string]string{"Token": token})
 		return
 	}
 
 	token := r.FormValue("token")
+	if token == "" {
+		// Fallbacks in case frontend passes a different name
+		token = r.FormValue("vtoken")
+		if token == "" {
+			token = r.URL.Query().Get("vtoken")
+		}
+	}
 	newPassword := r.FormValue("password")
 	confirmPassword := r.FormValue("confirmPassword")
 	apiKey := os.Getenv("LOGINRADIUS_API_KEY")
 
 	if newPassword != confirmPassword {
 		http.Error(w, "Passwords do not match", http.StatusBadRequest)
+		return
+	}
+	if token == "" {
+		http.Error(w, "Missing reset token", http.StatusBadRequest)
 		return
 	}
 
